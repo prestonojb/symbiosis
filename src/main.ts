@@ -1,256 +1,199 @@
-import { BigNumber, ethers } from 'ethers';
+import { ethers } from "ethers";
+import { toReadableAmount } from "./conversion";
+import { BalanceReport, CHAIN_CONFIG, CHAIN_NAMES, RPC_PROVIDER_BY_CHAIN, Token } from "./mappings";
+import { fetchSymbiosisSwap, waitSymbiosisTransactionSuccess } from "./symbiosis_api";
+import { config } from "./config";
+import { getTokenBalance, getTokenTransferApprovalOptional, sendTransaction } from "./providers";
 
-interface TokenAmount {
-  address: string;
-  amount: string;
-  chainId: number;
-  decimals: number;
+const SWAP_IN_RPC_PROVIDER = new ethers.providers.JsonRpcProvider(
+  `${RPC_PROVIDER_BY_CHAIN[config.SWAP_IN_CHAINID]}${config.PROVIDER_API_KEY}`,
+);
+
+const SWAP_OUT_RPC_PROVIDER = new ethers.providers.JsonRpcProvider(
+  `${RPC_PROVIDER_BY_CHAIN[config.SWAP_OUT_CHAINID]}${config.PROVIDER_API_KEY}`,
+);
+
+const SWAP_IN_WALLET = new ethers.Wallet(config.PRIVATE_KEY, SWAP_IN_RPC_PROVIDER);
+
+const WALLET_ADDRESS = SWAP_IN_WALLET.address;
+
+async function getBalanceReport(): Promise<BalanceReport> {
+  const swapInBalance = await getTokenBalance(
+    SWAP_IN_RPC_PROVIDER,
+    WALLET_ADDRESS,
+    config.SWAP_IN_TOKEN,
+  );
+
+  const swapOutBalance = await getTokenBalance(
+    SWAP_OUT_RPC_PROVIDER,
+    WALLET_ADDRESS,
+    config.SWAP_OUT_TOKEN,
+  );
+
+  return {
+    in: {
+      token: config.SWAP_IN_TOKEN,
+      amount: swapInBalance,
+      readableAmount: toReadableAmount(swapInBalance, config.SWAP_IN_TOKEN.decimals),
+    },
+    out: {
+      token: config.SWAP_OUT_TOKEN,
+      amount: swapOutBalance,
+      readableAmount: toReadableAmount(swapOutBalance, config.SWAP_OUT_TOKEN.decimals),
+    },
+  };
 }
 
-interface TokenOut {
-  chainId: number;
-  address: string;
-  symbol: string;
-  decimals: number;
+async function printBalances() {
+  const balanceReport = await getBalanceReport();
+
+  console.log(
+    `wallet balance:`,
+    `[in] ${CHAIN_NAMES[balanceReport.in.token.chain]} chain: ${balanceReport.in.readableAmount}${
+      balanceReport.in.token.symbol
+    };`,
+    `[out] ${CHAIN_NAMES[balanceReport.out.token.chain]} chain: ${
+      balanceReport.out.readableAmount
+    }${balanceReport.out.token.symbol}`,
+  );
+
+  console.log();
 }
 
-interface SwapRequest {
-  tokenAmountIn: TokenAmount;
-  tokenOut: TokenOut;
-  from: string;
-  to: string;
-  slippage: number;
-}
+async function approveTokenSpending(to: string) {
+  const receipt = await getTokenTransferApprovalOptional(
+    SWAP_IN_RPC_PROVIDER,
+    config.SWAP_IN_TOKEN,
+    SWAP_IN_WALLET,
+    to,
+    config.SWAP_IN_AMOUNT,
+  );
 
-interface Transaction {
-  chainId: number;
-  to: string;
-  data: string;
-  value: string;
-}
-
-interface Token {
-  address: string;
-  chainId: number;
-  chainIdFrom: number;
-  decimals: number;
-  symbol: string;
-  icon: string;
-  amount?: string;
-}
-
-interface Fee extends Token {
-  amount: string;
-}
-
-interface FeesProvider {
-  provider: string;
-  value: Fee;
-  save: Fee;
-  description: string;
-}
-
-interface TokenDetails {
-  address: string;
-  chainId: number;
-  chainIdFrom: number;
-  decimals: number;
-  symbol: string;
-  icon: string;
-  amount: string;
-}
-
-interface TransactionDetails {
-  hash: string;
-  chainId: number;
-  tokenAmount: TokenDetails;
-  time: string;
-  address: string;
-}
-
-interface TransactionStatus {
-  code: number;
-  text: string;
-}
-
-interface TransactionResponse {
-  status: TransactionStatus;
-  tx: TransactionDetails;
-  txIn: TransactionDetails;
-  transitTokenSent: TokenDetails;
-}
-
-interface Route {
-  provider: string;
-  tokens: Token[];
-}
-
-interface SwapResponse {
-  tx: Transaction;
-  fee: Fee;
-  fees: FeesProvider[];
-  route: Token[];
-  routes: Route[];
-  priceImpact: string;
-  tokenAmountOut: Token & { amount: string };
-  tokenAmountOutMin: Token & { amount: string };
-  amountInUsd: Token & { amount: string };
-  rewards: Token[];
-  approveTo: string;
-  inTradeType: string;
-  outTradeType: string;
-  type: string;
-  kind: string;
-  estimatedTime: number;
-}
-
-async function requestSwap(params: SwapRequest): Promise<SwapResponse> {
-  const url = 'https://api.symbiosis.finance/crosschain/v1/swap';
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'accept': 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(params)
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    // Basic runtime validation
-    if (!data || typeof data !== 'object' || !('tx' in data)) {
-      throw new Error('Invalid response format');
-    }
-
-    return data as SwapResponse;
-  } catch (error) {
-    console.error('Error requesting swap:', error);
-    throw error;
-  }
-}
-
-
-async function getTransaction(chainID: string, txHash: string): Promise<TransactionResponse> {
-  const url = `https://api.symbiosis.finance/crosschain/v1/${chainID}/${txHash}`;
-
-  try {
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'accept': 'application/json',
-        'Content-Type': 'application/json',
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    // Basic runtime validation
-    if (!data || typeof data !== 'object' || !('tx' in data)) {
-      throw new Error('Invalid response format');
-    }
-
-    return data as TransactionResponse;
-  } catch (error) {
-    console.error('Error requesting swap:', error);
-    throw error;
-  }
-}
-
-const walletAddress = "0xf93d011544e89a28b5bdbdd833016cc5f26e82cd";
-
-
-// Example usage:
-const swapParams: SwapRequest = {
-  tokenAmountIn: {
-    address: "",
-    amount: "50000000000000000",
-    chainId: 1, // ETH MAINET
-    decimals: 18
-  },
-  tokenOut: {
-    chainId: 5000, // MANTLE MAINNET
-    address: "0xdEAddEaDdeadDEadDEADDEAddEADDEAddead1111",
-    symbol: "WETH",
-    decimals: 18
-  },
-  from: walletAddress,
-  to: walletAddress,
-  slippage: 300
-};
-
-export enum TransactionState {
-  Failed = 'Failed',
-  New = 'New',
-  Rejected = 'Rejected',
-  Sending = 'Sending',
-  Sent = 'Sent',
-}
-
-const PROVIDER_API_KEY = "4_d6C_4P0bSJOxk4oSBAb48GG2iPqaYO";
-
-const l1Provider = new ethers.providers.JsonRpcProvider(`https://eth-mainnet.g.alchemy.com/v2/${PROVIDER_API_KEY}`);
-const l2Provider = new ethers.providers.JsonRpcProvider(`https://mantle-mainnet.g.alchemy.com/v2/${PROVIDER_API_KEY}`);
-
-const privateKey = "";
-
-const l1Wallet = new ethers.Wallet(privateKey, l1Provider);
-const l2Wallet = new ethers.Wallet(privateKey, l2Provider);
-
-function createWallet(): ethers.Wallet {
-  return new ethers.Wallet(privateKey, l1Provider)
-}
-
-async function sendTransaction(
-  transaction: ethers.providers.TransactionRequest
-): Promise<TransactionState> {
-  const provider = l2Provider;
-
-  if (!provider) {
-    return TransactionState.Failed
+  if (receipt === null) {
+    console.log(
+      `no token approval required for ${config.SWAP_IN_AMOUNT}${config.SWAP_IN_TOKEN.symbol} (${config.SWAP_IN_TOKEN.chain} chain) token spending`,
+    );
+    return;
   }
 
-  if (transaction.value) {
-    transaction.value = BigNumber.from(transaction.value)
-  }
-
-  const txRes = await l2Wallet.sendTransaction(transaction)
-  let receipt = null
-
-  while (receipt === null) {
-    try {
-      receipt = await provider.getTransactionReceipt(txRes.hash)
-
-      if (receipt === null) {
-        continue
-      }
-    } catch (e) {
-      console.log(`Receipt error:`, e)
-      break
-    }
-  }
-
-  if (receipt) {
-    return TransactionState.Sent
+  if (receipt.status === 1) {
+    console.log(
+      `approved ${config.SWAP_IN_AMOUNT}${config.SWAP_IN_TOKEN.symbol} (${
+        CHAIN_NAMES[config.SWAP_IN_TOKEN.chain]
+      } chain) token transfer allowance, tx hash=${receipt.transactionHash}}`,
+    );
   } else {
-    return TransactionState.Failed
+    throw new Error(`token approval tx failed, tx hash=${receipt.transactionHash}`);
   }
 }
 
-(async () => {
-  try {
-    const response = await requestSwap(swapParams);
-    console.log('Swap response:', response);
-  } catch (error) {
-    console.error('Error:', error);
+async function executeSwap(txData: string, txValue: string, txTo: string) {
+  const chainConfig = CHAIN_CONFIG[config.SWAP_IN_CHAINID];
+
+  const txReq: ethers.providers.TransactionRequest = {
+    data: txData,
+    value: txValue,
+    from: WALLET_ADDRESS,
+    to: txTo,
+    gasLimit: chainConfig.gasLimit,
+    maxFeePerGas: chainConfig.maxFeesPerGas,
+    maxPriorityFeePerGas: chainConfig.maxFeesPerGas,
+  };
+
+  const receipt = await sendTransaction(txReq, SWAP_IN_WALLET);
+  if (receipt.status === 1) {
+    console.log(
+      `executed swap tx on ${CHAIN_NAMES[config.SWAP_IN_TOKEN.chain]} with hash: ${
+        receipt.transactionHash
+      }, pending settlement from Symbiosis API`,
+    );
+
+    // swap is omnichain hence rely on symbiosis API to determine finality of swap
+    const swapSucceeded = await waitSymbiosisTransactionSuccess(
+      config.SWAP_IN_CHAINID,
+      receipt.transactionHash,
+    );
+    if (!swapSucceeded) {
+      throw new Error(`cross-chain swap not registered on Symbiosis API, may be stucked`);
+    }
+
+    return;
+  } else {
+    throw new Error(
+      `swap tx failed on chain: ${config.SWAP_IN_TOKEN.chain} with hash: ${receipt.transactionHash}`,
+    );
   }
-})();
+}
+
+function sinceSeconds(start: number): number {
+  return (Date.now() - start) / 1000;
+}
+
+async function main() {
+  console.log(
+    `executing cross-chain swap for wallet ${WALLET_ADDRESS}:
+        [in] ${config.SWAP_IN_AMOUNT}${config.SWAP_IN_TOKEN.symbol} (${
+      CHAIN_NAMES[config.SWAP_IN_TOKEN.chain]
+    } chain) -> [out] ${config.SWAP_OUT_TOKEN.symbol} (${
+      CHAIN_NAMES[config.SWAP_OUT_TOKEN.chain]
+    } chain)`,
+  );
+
+  await printBalances();
+
+  console.log(`fetch Symbiosis API swap data`);
+
+  const swapResponse = await fetchSymbiosisSwap(
+    config.SWAP_IN_TOKEN,
+    config.SWAP_IN_AMOUNT,
+    config.SWAP_OUT_TOKEN,
+    WALLET_ADDRESS,
+    WALLET_ADDRESS,
+    config.SLIPPAGE_TOLERANCE,
+  );
+
+  console.log(
+    `fetched Symbiosis API swap data,
+    token in: ${config.SWAP_IN_AMOUNT}${config.SWAP_IN_TOKEN.symbol},
+    suggested min token out: ${toReadableAmount(
+      ethers.BigNumber.from(swapResponse.tokenAmountOutMin.amount),
+      swapResponse.tokenAmountOutMin.decimals,
+    )}${config.SWAP_OUT_TOKEN.symbol},
+    estimated time: ${swapResponse.estimatedTime}s`,
+  );
+
+  console.log();
+
+  const approvalStartedAt = Date.now();
+
+  console.log(
+    `approve token spending for ${config.SWAP_IN_AMOUNT}${config.SWAP_IN_TOKEN.symbol} (${
+      CHAIN_NAMES[config.SWAP_IN_TOKEN.chain]
+    } chain) for address ${swapResponse.approveTo}`,
+  );
+
+  await approveTokenSpending(swapResponse.approveTo);
+
+  console.log(`approved token spending, took ${sinceSeconds(approvalStartedAt)}s`);
+
+  console.log();
+
+  const swapStartedAt = Date.now();
+
+  console.log("execute cross chain swap");
+
+  await executeSwap(swapResponse.tx.data, swapResponse.tx.value, swapResponse.tx.to);
+
+  console.log(`executed cross chain swap, took ${sinceSeconds(swapStartedAt)}s`);
+
+  await printBalances();
+}
+
+main()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((error) => {
+    console.log(error);
+    process.exit(1);
+  });
